@@ -17,10 +17,13 @@ struct Cli {
     target: InputOutput,
 
     #[arg(long, value_enum)]
-    action: Action,
+    action: Option<Action>,
 
     #[arg(long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
+
+    #[arg(long, value_enum)]
+    status: Option<Status>,
 
     #[arg(long)]
     prev: Option<u32>,
@@ -79,6 +82,15 @@ enum Action {
     Dec,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum Status {
+    Muted,
+    Volume,
+    Name,
+    Desc,
+}
+
+
 trait GenericController<T, K>: DeviceControl<T> + AppControl<K> + SetDefault {}
 impl<T, K, L> GenericController<K, L> for T
 where
@@ -115,7 +127,7 @@ fn ignore_monitor_devs(d: &&DeviceInfo) -> bool {
 }
 
 fn next_dev(
-    mut controller: Box<Controller>,
+    controller: &mut Box<Controller>,
     direction: Direction,
     prev: DeviceInfo,
     input_output: InputOutput,
@@ -144,6 +156,7 @@ fn next_dev(
 
     info!("Setting default device to: {:?}", next_device.index);
     controller.set_default(next_device.index)?;
+    controller.set_default_device(next_device.name.clone().unwrap_or_default().as_ref())?;
     fs_helpers::write_device_index(input_output, next_device.index)?;
     Ok(())
 }
@@ -178,22 +191,34 @@ fn main() -> anyhow::Result<()> {
     let prev_device = get_default_device(&mut controller, cli.target)?;
 
     match cli.action {
-        Action::Next => {
-            next_dev(controller, Direction::Forward, prev_device, cli.target)?;
+        Some(Action::Next) => {
+            next_dev(& mut controller, Direction::Forward, prev_device, cli.target)?;
         }
-        Action::Prev => {
-            next_dev(controller, Direction::Backward, prev_device, cli.target)?;
+        Some(Action::Prev) => {
+            next_dev(& mut controller, Direction::Backward, prev_device, cli.target)?;
         }
-        Action::Mute => {
+        Some(Action::Mute) => {
             controller.set_device_mute_by_index(prev_device.index, !prev_device.mute);
         }
-        Action::Inc => {
+        Some(Action::Inc) => {
             controller.increase_device_volume_by_percent(prev_device.index, 0.05);
         }
-        Action::Dec => {
+        Some(Action::Dec) => {
             controller.decrease_device_volume_by_percent(prev_device.index, 0.05);
         }
+        None => {}
     };
+
+    if let Some(status) = cli.status{
+        let dev = fs_helpers::read_device_index(cli.target)?;
+        let info = controller.get_device_by_index(dev.unwrap())?;
+        match status{
+            Status::Muted => print!("{}", info.mute),
+            Status::Volume => print!("{}", info.volume),
+            Status::Name => print!("{}", info.name.clone().unwrap_or_default()),
+            Status::Desc => print!("{}", info.description.clone().unwrap_or_default()),
+        }
+    }
 
     Ok(())
 }
