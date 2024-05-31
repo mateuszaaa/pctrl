@@ -74,24 +74,26 @@ where
     fn get_default(&mut self) -> anyhow::Result<u32> {
         todo!()
     }
-
-
 }
 
-fn next_dev(mut controller: Box<Controller>, direction: Direction, prev: Option<u32>) -> anyhow::Result<()> {
+fn next_dev(
+    mut controller: Box<Controller>,
+    direction: Direction,
+    prev: Option<u32>,
+) -> anyhow::Result<()> {
     let devices = controller.list_devices().unwrap_or_default();
 
     let filter_out_monitor_devs = |d: &&DeviceInfo| {
-            !d.name.clone().unwrap_or_default().to_lowercase().contains("monitor")
+        !d.name
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("monitor")
     };
 
-    let default_device = prev.and_then(|index|
-        devices
-            .iter()
-            .cloned()
-            .find(|d| d.index == index)
-    ).or(controller.get_default_device().ok());
-
+    let default_device = prev
+        .and_then(|index| devices.iter().cloned().find(|d| d.index == index))
+        .or(controller.get_default_device().ok());
 
     if let Some(prev) = default_device {
         debug!("Default device found #{} {:?}", prev.index, prev.name);
@@ -126,15 +128,12 @@ fn next_dev(mut controller: Box<Controller>, direction: Direction, prev: Option<
         }
     } else {
         debug!("Default device not set");
-        if let Some(ref d) = devices.iter()
-            .filter(filter_out_monitor_devs)
-            .next() {
+        if let Some(ref d) = devices.iter().filter(filter_out_monitor_devs).next() {
             info!("Setting default device to: {:?}", d.index);
             controller.set_default(d.index)?;
-        }else{
+        } else {
             info!("No available devices");
         }
-            
     }
     Ok(())
 }
