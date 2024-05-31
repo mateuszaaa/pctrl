@@ -1,13 +1,14 @@
-use anyhow;
+use anyhow::anyhow;
 use either::Either;
 use env_logger::{self, Builder};
-use log::{debug, error, info, LevelFilter};
+use log::{debug, error, info, warn, LevelFilter};
 use pulsectl::controllers::{
     types::{ApplicationInfo, DeviceInfo},
     AppControl, DeviceControl, SinkController, SourceController,
 };
 
 use clap::{Parser, ValueEnum};
+mod fs_helpers;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -23,6 +24,39 @@ struct Cli {
 
     #[arg(long)]
     prev: Option<u32>,
+}
+
+fn get_default_device(
+    controller: &mut Box<Controller>,
+    input_output: InputOutput,
+) -> anyhow::Result<DeviceInfo> {
+    if let Some(idx) = fs_helpers::read_device_index(input_output)?{
+        if let Ok(device) = controller.get_device_by_index(idx) {
+            debug!("Device with index #{} found: {:?}", idx, device.name);
+            Ok(device)
+        }else{
+            warn!("Device with index {} not found - figuring out new default device", idx);
+            //TODO: try to fetch default device first from pulse audio
+            let dev = controller
+                .list_devices()?
+                .iter()
+                .filter(ignore_monitor_devs)
+                .cloned()
+                .next()
+                .ok_or(anyhow!("No devices found"))?;
+            fs_helpers::write_device_index(input_output, dev.index)?;
+            Ok(dev.clone())
+        }
+    }else{
+        debug!("No previous state stored");
+        let dev = controller
+            .list_devices()?
+            .first()
+            .cloned()
+            .ok_or(anyhow!("No devices found"))?;
+        fs_helpers::write_device_index(input_output, dev.index)?;
+        Ok(dev.clone())
+    }
 }
 
 enum Direction {
@@ -58,7 +92,6 @@ type Controller = dyn GenericController<DeviceInfo, ApplicationInfo>;
 /// sets given index for all runntine applications
 pub trait SetDefault {
     fn set_default(&mut self, index: u32) -> anyhow::Result<()>;
-    fn get_default(&mut self) -> anyhow::Result<u32>;
 }
 
 impl<T> SetDefault for T
@@ -71,65 +104,47 @@ where
         }
         Ok(())
     }
+}
 
-    fn get_default(&mut self) -> anyhow::Result<u32> {
-        todo!()
-    }
+fn ignore_monitor_devs(d: &&DeviceInfo) -> bool {
+    !d.name
+        .clone()
+        .unwrap_or_default()
+        .to_lowercase()
+        .contains("monitor")
 }
 
 fn next_dev(
     mut controller: Box<Controller>,
     direction: Direction,
-    prev: Option<u32>,
+    prev: DeviceInfo,
+    input_output: InputOutput,
 ) -> anyhow::Result<()> {
     let devices = controller.list_devices().unwrap_or_default();
 
-    let filter_out_monitor_devs = |d: &&DeviceInfo| {
-        !d.name
-            .clone()
-            .unwrap_or_default()
-            .to_lowercase()
-            .contains("monitor")
+    let iter: Either<_,_> = match direction {
+        Direction::Forward => Either::Left(devices.iter()),
+        Direction::Backward => Either::Right(devices.iter().rev()),
     };
 
-    let default_device = prev
-        .and_then(|index| devices.iter().cloned().find(|d| d.index == index))
-        .or(controller.get_default_device().ok());
-
-    if let Some(prev) = default_device {
-        debug!("Default device found #{} {:?}", prev.index, prev.name);
-
-        let iter: Either<_,_> = match direction {
-            Direction::Forward => Either::Left(devices.iter()),
-            Direction::Backward => Either::Right(devices.iter().rev()),
-        };
-     
-        let next_device = iter
-            .filter(filter_out_monitor_devs)
-            .cycle()
-            .skip_while(|d| d.index != prev.index)
-            .skip(1)
-            .next();
-
-        match next_device {
-            Some(ref d) if d.index == prev.index => {
-                info!("There is only one sink availble, doing nothing");
-            }
-            Some(ref d) => {
-                info!("Setting default device to: {:?}", d.index);
-                controller.set_default(d.index)?;
-            }
-            None => {}
-        }
-    } else {
-        debug!("Default device not set");
-        if let Some(ref d) = devices.iter().filter(filter_out_monitor_devs).next() {
-            info!("Setting default device to: {:?}", d.index);
-            controller.set_default(d.index)?;
-        } else {
-            info!("No available devices");
-        }
+    for d in devices.iter()
+        .filter(ignore_monitor_devs)
+    {
+        debug!("Found devices: {:?}", d.index);
     }
+
+    let next_device = iter
+        .cycle()
+        .take(devices.len()*2)
+        .skip_while(|d| d.index != prev.index)
+        .skip(1)
+        .filter(ignore_monitor_devs)
+        .next()
+        .expect("At least one device should be available at this point");
+
+    info!("Setting default device to: {:?}", next_device.index);
+    controller.set_default(next_device.index)?;
+    fs_helpers::write_device_index(input_output, next_device.index)?;
     Ok(())
 }
 
@@ -160,27 +175,23 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let prev_device = get_default_device(&mut controller, cli.target)?;
+
     match cli.action {
         Action::Next => {
-            next_dev(controller, Direction::Forward, cli.prev)?;
+            next_dev(controller, Direction::Forward, prev_device, cli.target)?;
         }
         Action::Prev => {
-            next_dev(controller, Direction::Backward, cli.prev)?;
+            next_dev(controller, Direction::Backward, prev_device, cli.target)?;
         }
         Action::Mute => {
-            if let Ok(default) = controller.get_default_device() {
-                controller.set_device_mute_by_index(default.index, !default.mute);
-            }
+            controller.set_device_mute_by_index(prev_device.index, !prev_device.mute);
         }
         Action::Inc => {
-            if let Ok(default) = controller.get_default_device() {
-                controller.increase_device_volume_by_percent(default.index, 0.05);
-            }
+            controller.increase_device_volume_by_percent(prev_device.index, 0.05);
         }
         Action::Dec => {
-            if let Ok(default) = controller.get_default_device() {
-                controller.decrease_device_volume_by_percent(default.index, 0.05);
-            }
+            controller.decrease_device_volume_by_percent(prev_device.index, 0.05);
         }
     };
 
