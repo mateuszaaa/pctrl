@@ -1,4 +1,5 @@
 use anyhow;
+use either::Either;
 use env_logger::{self, Builder};
 use log::{debug, error, info, LevelFilter};
 use pulsectl::controllers::{
@@ -98,23 +99,17 @@ fn next_dev(
     if let Some(prev) = default_device {
         debug!("Default device found #{} {:?}", prev.index, prev.name);
 
-        let next_device = match direction {
-            Direction::Forward => devices
-                .iter()
-                .filter(filter_out_monitor_devs)
-                .cycle()
-                .skip_while(|d| d.index != prev.index)
-                .skip(1)
-                .next(),
-            Direction::Backward => devices
-                .iter()
-                .filter(filter_out_monitor_devs)
-                .rev()
-                .cycle()
-                .skip_while(|d| d.index != prev.index)
-                .skip(1)
-                .next(),
+        let iter: Either<_,_> = match direction {
+            Direction::Forward => Either::Left(devices.iter()),
+            Direction::Backward => Either::Right(devices.iter().rev()),
         };
+     
+        let next_device = iter
+            .filter(filter_out_monitor_devs)
+            .cycle()
+            .skip_while(|d| d.index != prev.index)
+            .skip(1)
+            .next();
 
         match next_device {
             Some(ref d) if d.index == prev.index => {
