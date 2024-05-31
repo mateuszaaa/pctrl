@@ -1,7 +1,10 @@
 use anyhow;
 use env_logger::{self, Builder};
 use log::{debug, error, info, LevelFilter};
-use pulsectl::controllers::{types::DeviceInfo, DeviceControl, SinkController, SourceController};
+use pulsectl::controllers::{
+    types::{ApplicationInfo, DeviceInfo},
+    AppControl, DeviceControl, SinkController, SourceController,
+};
 
 use clap::{Parser, ValueEnum};
 
@@ -16,6 +19,9 @@ struct Cli {
 
     #[arg(long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
+
+    #[arg(long)]
+    prev: Option<u32>,
 }
 
 enum Direction {
@@ -38,87 +44,97 @@ enum Action {
     Dec,
 }
 
-fn next_dev(
-    mut controller: Box<dyn DeviceControl<DeviceInfo>>,
-    direction: Direction,
-) -> anyhow::Result<()> {
+trait GenericController<T, K>: DeviceControl<T> + AppControl<K> + SetDefault {}
+impl<T, K, L> GenericController<K, L> for T
+where
+    T: DeviceControl<K>,
+    T: AppControl<L>,
+    T: SetDefault,
+{
+}
+type Controller = dyn GenericController<DeviceInfo, ApplicationInfo>;
+
+/// sets given index for all runntine applications
+pub trait SetDefault {
+    fn set_default(&mut self, index: u32) -> anyhow::Result<()>;
+    fn get_default(&mut self) -> anyhow::Result<u32>;
+}
+
+impl<T> SetDefault for T
+where
+    T: AppControl<ApplicationInfo>,
+{
+    fn set_default(&mut self, index: u32) -> anyhow::Result<()> {
+        for app in self.list_applications()? {
+            self.move_app_by_index(app.index, index)?;
+        }
+        Ok(())
+    }
+
+    fn get_default(&mut self) -> anyhow::Result<u32> {
+        todo!()
+    }
+
+
+}
+
+fn next_dev(mut controller: Box<Controller>, direction: Direction, prev: Option<u32>) -> anyhow::Result<()> {
     let devices = controller.list_devices().unwrap_or_default();
-    if let Ok(default) = controller.get_default_device() {
-        debug!("Default device found {:?}", default.name);
+
+    let filter_out_monitor_devs = |d: &&DeviceInfo| {
+            !d.name.clone().unwrap_or_default().to_lowercase().contains("monitor")
+    };
+
+    let default_device = prev.and_then(|index|
+        devices
+            .iter()
+            .cloned()
+            .find(|d| d.index == index)
+    ).or(controller.get_default_device().ok());
+
+
+    if let Some(prev) = default_device {
+        debug!("Default device found #{} {:?}", prev.index, prev.name);
 
         let next_device = match direction {
             Direction::Forward => devices
                 .iter()
+                .filter(filter_out_monitor_devs)
                 .cycle()
-                .skip_while(|d| d.index != default.index)
+                .skip_while(|d| d.index != prev.index)
                 .skip(1)
                 .next(),
             Direction::Backward => devices
                 .iter()
+                .filter(filter_out_monitor_devs)
                 .rev()
                 .cycle()
-                .skip_while(|d| d.index != default.index)
+                .skip_while(|d| d.index != prev.index)
                 .skip(1)
                 .next(),
         };
 
         match next_device {
-            Some(ref d) if d.index == default.index => {
+            Some(ref d) if d.index == prev.index => {
                 info!("There is only one sink availble, doing nothing");
             }
             Some(ref d) => {
-                info!("Setting default device to: {:?}", d.name);
-                let name = d.name.clone().unwrap_or_default();
-                controller.set_default_device(name.as_ref())?;
+                info!("Setting default device to: {:?}", d.index);
+                controller.set_default(d.index)?;
             }
-            None => {
-            }
+            None => {}
         }
     } else {
         debug!("Default device not set");
-        if let Some(ref d) = devices.iter().next() {
-            info!("Setting default device to: {:?}", d.name);
-            let name = d.name.clone().unwrap_or_default();
+        if let Some(ref d) = devices.iter()
+            .filter(filter_out_monitor_devs)
+            .next() {
+            info!("Setting default device to: {:?}", d.index);
+            controller.set_default(d.index)?;
+        }else{
+            info!("No available devices");
         }
-    }
-    Ok(())
-}
-
-fn prev_sink(mut controller: SinkController) -> anyhow::Result<()> {
-    let devices = controller.list_devices().unwrap_or_default();
-    if let Ok(default) = controller.get_default_device() {
-        debug!("Default device found {:?}", default.name);
-        let prev_device = devices
-            .iter()
-            .rev()
-            .cycle()
-            .skip_while(|d| d.index != default.index)
-            .skip(1)
-            .next();
-
-        match prev_device {
-            Some(ref d) if d.index == default.index => {
-                info!("There is only one sink availble, doing nothing");
-                // do nothing
-            }
-            Some(ref d) => {
-                info!("Setting default device to: {:?}", d.name);
-                let name = d.name.clone().unwrap_or_default();
-                controller.set_default_device(name.as_ref())?;
-            }
-            None => {
-                // do nothin
-            }
-        }
-    } else {
-        debug!("Default device not set");
-        let next_device = devices.iter().next();
-
-        if let Some(ref d) = next_device {
-            info!("Setting default device to: {:?}", d.name);
-            let name = d.name.clone().unwrap_or_default();
-            controller.set_default_device(name.as_ref())?;
-        }
+            
     }
     Ok(())
 }
@@ -135,7 +151,7 @@ fn main() -> anyhow::Result<()> {
 
     builder.filter(None, level).init();
 
-    let mut controller: Box<dyn DeviceControl<DeviceInfo>> = match cli.target {
+    let mut controller: Box<Controller> = match cli.target {
         InputOutput::Input => Box::new(SourceController::create()?),
         InputOutput::Output => Box::new(SinkController::create()?),
     };
@@ -144,18 +160,18 @@ fn main() -> anyhow::Result<()> {
     if devices.is_empty() {
         error!("No devices found");
         return Ok(());
-    }else{
-        for d in devices.iter(){
+    } else {
+        for d in devices.iter() {
             debug!("Found devices: {:?}", d.name);
         }
     }
 
     match cli.action {
         Action::Next => {
-            next_dev(controller, Direction::Forward)?;
+            next_dev(controller, Direction::Forward, cli.prev)?;
         }
         Action::Prev => {
-            next_dev(controller, Direction::Backward)?;
+            next_dev(controller, Direction::Backward, cli.prev)?;
         }
         Action::Mute => {
             if let Ok(default) = controller.get_default_device() {
